@@ -1,0 +1,391 @@
+library(xgboost)
+library(data.table)
+library(dplyr)
+library(readxl)
+
+model_data <- fread('/data/lake/plds/datahub/pl_plm_model/Merkle_NB_ARD_Processed_Data.csv')
+
+merkle_rules <- as.data.table(read_excel("/data/lake/plds/datahub/pl_plm_model/data_rules/all_merkle_validation_rule_edited_v2.xlsx"))
+
+merkle_model_vars <- merkle_rules$new_nm[which(merkle_rules$model_var_flag == 1)]
+orig_plm_model_vars <- merkle_rules$new_nm[which(merkle_rules$plm_model_var_flag == 1)]
+
+cont_vars <-  merkle_rules$Variable[which(merkle_rules$var_type %in% c('Continuous') &
+                                       merkle_rules$model_var_flag == 1)]
+cv_vars <- merkle_rules[Variable %in% cont_vars, new_nm]
+for(var in cv_vars){
+    model_data[, (var) := as.numeric(model_data[[var]])]
+}
+
+cat_vars <-  merkle_rules$Variable[which(merkle_rules$var_type %in% c('Discrete', 'Binary') &
+                                       merkle_rules$model_var_flag == 1)]
+cf_vars <- merkle_rules[Variable %in% cat_vars, new_nm]
+for(var in cf_vars){
+    model_data[, (var) := as.factor(model_data[[var]])]
+}
+
+
+cf_vars
+
+model_data$cf_POLICY_YEAR <- as.factor(model_data$POLICY_YEAR)
+
+colnames(model_data)
+
+model_data[,`:=` (target = ADJ_XCAT_CAP_LOSS_RATIO, weight = TOTAL_EPAPR)]
+
+train_split <- model_data[data_partition == 'Train' & POLICY_YEAR >= 2015,]
+test_split <- model_data[data_partition == 'Test' & POLICY_YEAR >= 2015,]
+#train_test_split <- model_data[data_partition %in% c('Train', 'Test'),]
+#train_split <- model_data[time_partition == 'Train',]
+#test_split <- model_data[time_partition == 'Test',]
+#train_split <- model_data[time_partition_40mo == 'Train' & inforce_ind == 'Y',]
+#test_split <- model_data[time_partition_40mo == 'Test' & inforce_ind == 'Y',]
+#train_split <- model_data[time_partition_36mo == 'Train' & inforce_ind == 'Y',]
+#test_split <- model_data[time_partition_36mo == 'Test' & inforce_ind == 'Y',]
+#train_split <- model_data[time_partition_30mo == 'Train' & inforce_ind == 'Y',]
+#test_split <- model_data[time_partition_30mo == 'Test' & inforce_ind == 'Y',]
+
+colnames(model_data)
+
+data_partition_tbl <- model_data[inforce_ind == 'Y' & time_partition_30mo %in% c('Train', 'Test'),
+                                 list(row_count = .N,
+                                      total_prem = sum(TOTAL_EPAPR),
+                                      total_loss = sum(TOT_XCAT_CAP_ULT_LOSS_AMT)),
+                                 by = data_partition]
+data_partition_tbl[, `:=` (loss_ratio = total_loss/total_prem,
+                          row_perc = row_count/sum(row_count))]
+data_partition_tbl
+
+## xgb matrix setup
+
+var_list <- c(cv_vars, cf_vars)
+#var_list <- c(cv_vars, cf_vars, 'cf_POLICY_YEAR')
+#var_list <- orig_plm_model_vars
+
+train_data_mtx <- data.matrix(train_split[,c(var_list, 'weight', 'target'), with = FALSE])
+test_data_mtx <- data.matrix(test_split[,c(var_list, 'weight', 'target'), with = FALSE])
+full_data_mtx <- data.matrix(model_data[,c(var_list, 'weight', 'target'), with = FALSE])
+train_mtx <- xgb.DMatrix(data = train_data_mtx[,var_list], label = train_data_mtx[,'target'],
+                         weight = train_data_mtx[,'weight'])
+test_mtx <- xgb.DMatrix(data = test_data_mtx[,var_list], label = test_data_mtx[,'target'],
+                        weight = test_data_mtx[,'weight'])
+full_mtx <- xgb.DMatrix(data = full_data_mtx[,var_list],
+                             label = full_data_mtx[,'target'],
+                             weight = full_data_mtx[,'weight'])
+
+## Grid search
+
+searchGridSubCol <- expand.grid(subsample = c(0.9, 0.95), 
+                                colsample_bytree = seq(0.1, 0.2),
+                                max_depth = c(2, 3),
+                                min_child_weight = c(1, 100000, 1000000, 10000000),
+                                gamma = c(0, 1, 2),
+                                eta = 0.1,
+                                tweedie_variance_power = seq(1.1, 1.8, by = 0.1),
+                                alpha = 1,
+                                lambda = 1
+                                
+)
+
+ntrees <- 4000
+output_v2 <- data.frame()
+
+system.time(
+for(i in 1:nrow(searchGridSubCol)){
+  fit_tm <- proc.time()
+  xgboostModelCV <- xgb.cv(data =  train_mtx, nrounds = ntrees, nfold = 4, #showsd = TRUE, 
+                           #params = best_params,
+                           params = as.list(searchGridSubCol[i,]),
+                           verbose = FALSE, 
+                           objective = "reg:tweedie", # assume we're always modeling pure premium
+                           eval_metric = paste0("tweedie-nloglik@", searchGridSubCol[i,'tweedie_variance_power']), # rmse or tweedie-nloglik@1.5
+                           booster = 'gbtree',
+                           maximize = FALSE,
+                           nthread = 75,
+                           #print_every_n = 10, 
+                           early_stopping_rounds = 3)
+  fit_tm_final <- (proc.time() - fit_tm)
+  nloglike <- tail(xgboostModelCV$evaluation_log[[paste0("test_tweedie_nloglik@", searchGridSubCol[i, 'tweedie_variance_power'], '_mean')]],1)
+  t_nloglike <- tail(xgboostModelCV$evaluation_log[[paste0("train_tweedie_nloglik@", searchGridSubCol[i, 'tweedie_variance_power'], '_mean')]],1)
+  output_v2 <- rbind(output_v2, c(nloglike, t_nloglike, searchGridSubCol[i, 'subsample'], searchGridSubCol[i, 'colsample_bytree'],
+                        searchGridSubCol[i, 'max_depth'], searchGridSubCol[i, 'eta'], searchGridSubCol[i, 'min_child_weight'],
+                        searchGridSubCol[i, 'tweedie_variance_power'], xgboostModelCV$best_iteration,
+                        searchGridSubCol[i, 'gamma'], searchGridSubCol[i, 'alpha'], searchGridSubCol[i, 'lambda'],
+                        fit_tm_final[3]))
+  varnames <- c("Test_NLoglike", "Train_NLoglike", "RowSampRate", "ColSampRate", "Depth", "eta", "MinChild", 'tweedie_variance_power',
+              'ntrees', 'gamma', 'alpha', 'lambda', 'fit_tm')
+  names(output_v2) <- varnames
+  output_v2 <- output_v2[order(output_v2$Test_NLoglike, decreasing = FALSE),]
+  saveRDS(output_v2, '/data/user/nh81470e/pl_plm_model/src/r/xgboost_grid_sample_depth.rds')
+})
+
+output_v2
+
+varnames <- c("Test NLoglike", "Train NLoglike", "RowSampRate", "ColSampRate", "Depth", "eta", "MinChild", 'tweedie_variance_power',
+              'ntrees', 'gamma', 'alpha', 'lambda')
+names(output_v2) <- varnames
+output_v2 <- output_v2[order(output_v2$`Test NLoglike`, decreasing = FALSE),]
+output_v2
+saveRDS(output_v2, '/data/user/nh81470e/pl_plm_model/src/r/xgboost_grid_sample_depth.rds')
+
+sum(train_split$ADJ_LOSS)/sum(train_split$TOTAL_EPAPR)
+
+sum(test_split$ADJ_LOSS)/sum(test_split$TOTAL_EPAPR)
+
+## Build Model
+
+head(readRDS('xgboost_grid_sample_depth_1018.rds'))
+
+best_params <- list(min_child_weight = 1e+07, max_depth = 2,
+                    subsample = 0.9, colsample_bytree = 0.1, 
+                    eta= .1,
+                    tweedie_variance_power = 1.71,
+                    gamma = 1, alpha = 1, lambda = 1)
+
+set.seed(9862)
+xgboostFinalModel <- xgb.train(data = train_mtx, nrounds = 2000,
+                           watchlist = list(test = test_mtx),
+                           #nfolds = 5,
+                           params = best_params,
+                           booster = 'gbtree',
+                           #verbose = TRUE, 
+                           #objective = "reg:gamma",
+                           objective = "reg:tweedie", # assume we're always modeling pure premium
+                           eval_metric = paste0("tweedie-nloglik@", best_params$tweedie_variance_power),
+                           #objective = 'count:poisson',# assume we're always modeling pure premium
+                           #eval_metric = "rmse", # rmse or tweedie-nloglik@1.5
+                           maximize = FALSE,
+                           print_every_n = 50, 
+                           early_stopping_rounds = 1)
+
+## Validation
+
+head(xgb.importance(feature_names = var_list,model = xgboostFinalModel), 30)
+
+utils_folder <- paste0('/data/user/', Sys.info()[["user"]], '/pl_utils/src/r/')
+function_list <- c('error_tabs_pretty.R', 'weighted_gini.R', 'normalized_weighted_gini.R',
+                   'weighted_rmse.R', 'plot_a_vs_e2_loss_ratio_dt.R', 'sorter_function.R', 'pretty_table.R',
+                   'get_pdp.R', 'weighted_mae.R', 'lr_plm_chart.R', 'lr_percentile_chart.R',
+                   'lr_percentile_comparison_chart.R', 'lr_spread_chart.R')
+for(func in function_list) source(paste0(utils_folder, func))
+
+train_split$predictions <- predict(xgboostFinalModel, train_mtx)
+train_split$pred_loss <- train_split$predictions*train_split$TOTAL_EPAPR
+test_split$predictions <- predict(xgboostFinalModel, test_mtx)
+test_split$pred_loss <- test_split$predictions*test_split$TOTAL_EPAPR
+model_data$predictions <- predict(xgboostFinalModel, full_mtx)
+
+normalized_weighted_gini(solution = train_split$target,
+                       weights = train_split$weight,
+                       submission = train_split$predictions)
+normalized_weighted_gini(solution = test_split$target,
+                       weights = test_split$weight,
+                       submission = test_split$predictions)
+normalized_weighted_gini(solution = test_split[time_partition == 'Test', target],
+                       weights = test_split[time_partition == 'Test', weight],
+                       submission = test_split[time_partition == 'Test', predictions])
+
+## Pull out current PLM decile splits, weighted by premium
+
+total_premium <- sum(model_data$weight[!model_data$PLM_decile %in% c(90, NA)])
+plm_decile_splits <- model_data %>%
+                        filter(!PLM_decile %in% c(90, NA)) %>%
+                        group_by(PLM_decile) %>%
+                        summarise(prem = sum(weight)/total_premium) %>%
+                        mutate(cumulative_prem = cumsum(prem))
+
+
+plm_decile_splits
+sum(plm_decile_splits$prem)
+
+train_split[is.na(PLM_decile), PLM_decile := 90]
+test_split[is.na(PLM_decile), PLM_decile := 90]
+
+## Loss ratio spread charts (attractive vs. unnatractive average loss ratio)
+
+lr_spread_chart(model_data, 'target', 'predictions', 'weight', 'TOT_XCAT_CAP_ULT_LOSS_AMT',
+                              nbuckets = 100, title1 = 'Unattractive', 'Attractive')
+
+lr_spread_chart(train_split, 'target', 'predictions', 'weight', 'TOT_XCAT_CAP_ULT_LOSS_AMT',
+                              nbuckets = 100, title1 = 'Unattractive', 'Attractive')
+
+lr_spread_chart(test_split, 'target', 'predictions', 'weight', 'TOT_XCAT_CAP_ULT_LOSS_AMT',
+                              nbuckets = 100, title1 = 'Unattractive', 'Attractive')
+
+lr_spread_chart(test_split[time_partition == 'Test',], 'target', 'predictions', 'weight', 'TOT_XCAT_CAP_ULT_LOSS_AMT',
+                              nbuckets = 100, title1 = 'Unattractive', title2 = 'Attractive')
+
+## Train vs. Test Loss ratio comparisons by decile
+
+lr_percentile_comparison_chart(model_data, test_split, 'target', 'predictions', 'weight', 'TOT_XCAT_CAP_ULT_LOSS_AMT',
+                              nbuckets = 10,
+                              custom_cuts = FALSE, cut_tbl = plm_decile_splits, cut_tbl_bin = 'cumulative_prem',
+                              cut_tbl_label = 'PLM_decile', title1 = 'Full Data', title2 = 'Test')
+
+lr_percentile_comparison_chart(train_split, test_split, 'target', 'predictions', 'weight', 'TOT_XCAT_CAP_ULT_LOSS_AMT',
+                               nbuckets = 10,
+                              custom_cuts = FALSE, cut_tbl = plm_decile_splits, cut_tbl_bin = 'cumulative_prem',
+                              cut_tbl_label = 'PLM_decile', title1 = 'Train', title2 = 'Test')
+
+## Actual vs Expected
+
+suppressWarnings({
+require(grid)
+require(gridExtra)
+
+top_vars <- xgb.importance(feature_names = var_list,model = xgboostFinalModel)$Feature
+
+pdf('plm_xgboost_train_ave_timepart.pdf')
+for(var in top_vars){
+        train_plot <- plot_a_vs_e2(dt = train_split, actual = 'ADJ_LOSS_RATIO', pred = 'predictions',
+             old_pred = 'predictions', wgt = 'TOTAL_EPAPR',
+             by_var = var)
+    }
+dev.off()
+
+pdf('plm_xgboost_test_ave_timepart.pdf')
+for(var in top_vars){
+    test_plot <- plot_a_vs_e2(dt = test_split, actual = 'ADJ_LOSS_RATIO', pred = 'predictions',
+             old_pred = 'predictions', wgt = 'TOTAL_EPAPR',
+             by_var = var)
+  }
+dev.off()
+})
+
+## Loss ratio by policy year & decile
+
+library(plotly)
+library(rlang)
+      
+lr_plm_pol_chart <- function(data, target, predictions, weight, actual_loss,
+                             pre_sort = FALSE, pre_sort_col = NULL, custom_cuts = FALSE,
+                             cut_tbl, cut_tbl_bin, cut_tbl_label){
+    
+weight_sum <- sum(data[[weight]])+1
+
+if(pre_sort == TRUE){
+    df_sort <- data
+    df_sort$loss_ratio_band <- as.factor(data[[pre_sort_col]])
+    
+} else if(custom_cuts == TRUE){
+    df_sort <- data %>%
+                   arrange_at(.vars = c(predictions)) %>%
+                   mutate_at(.vars = c(weight),
+                             .funs = funs(cumulative_wgt = cumsum(.)/weight_sum)
+                             ) %>%
+                   mutate_at(.vars = c(predictions),
+                             .funs = funs(loss_ratio_band = cut(cumulative_wgt,
+                                                                breaks = c(0, cut_tbl[[cut_tbl_bin]]),
+                                                                labels = cut_tbl[[cut_tbl_label]])
+                                         )
+                            )
+} else{
+        df_sort <- data %>%
+                   arrange_at(.vars = c(predictions)) %>%
+                   mutate_at(.vars = c(weight),
+                             .funs = funs(loss_ratio_band = floor(cumsum(.) / weight_sum * 10)/10)
+                            )
+} 
+    
+df_temp <- df_sort %>%
+            group_by(loss_ratio_band, POLICY_YEAR) %>%
+            summarise(model_loss_ratio = sum(!!sym(predictions)*!!sym(weight))/sum(!!sym(weight)),
+                      actual_loss_ratio = sum(!!sym(actual_loss))/sum(!!sym(weight))) %>%
+            ungroup()
+    
+df_temp$loss_ratio_band <- as.factor(df_temp$loss_ratio_band)
+df_temp$POLICY_YEAR <- as.factor(df_temp$POLICY_YEAR)
+    
+ chart <- df_temp %>%
+          plot_ly(x = ~loss_ratio_band,
+                  y= ~actual_loss_ratio,
+                  split = ~POLICY_YEAR, 
+                  type = 'scatter', mode = 'lines+markers') %>%
+                  layout(title = 'Actual vs. Predicted Loss Ratio',
+                    xaxis = list(title = "Percentile"),
+                    yaxis = list(title = "Loss Ratio"))
+
+ return(chart)
+# return(df_temp)
+}
+
+## Train Data, random split, plm width deciles
+
+lr_plm_pol_chart(train_split, 'target', 'predictions', 'weight', 'ADJ_LOSS', custom_cuts = TRUE, cut_tbl = plm_decile_splits, cut_tbl_bin = 'cumulative_prem',
+                 cut_tbl_label = 'PLM_decile')
+
+## Test Data, random split, plm width deciles
+
+lr_plm_pol_chart(test_split, 'target', 'predictions', 'weight', 'ADJ_LOSS', custom_cuts = TRUE, cut_tbl = plm_decile_splits, cut_tbl_bin = 'cumulative_prem',
+                 cut_tbl_label = 'PLM_decile')
+
+## Test Data, sorted by current plm deciles
+
+lr_plm_pol_chart(test_split, 'target', 'predictions', 'weight', 'ADJ_LOSS', pre_sort = TRUE,
+                   pre_sort_col = 'PLM_decile')
+
+## PLM Decile, Actual, Predicted on same plot 
+
+library(plotly)
+library(rlang)
+      
+lr_plm_pol_chart <- function(data, target, predictions, weight, actual_loss,
+                             pre_sort = FALSE, pre_sort_col = NULL, custom_cuts = FALSE,
+                             cut_tbl, cut_tbl_bin, cut_tbl_label){
+    
+weight_sum <- sum(data[[weight]])+1
+
+if(pre_sort == TRUE){
+    df_sort <- data
+    df_sort$loss_ratio_band <- as.factor(data[[pre_sort_col]])
+    
+} else if(custom_cuts == TRUE){
+    df_sort <- data %>%
+                   arrange_at(.vars = c(predictions)) %>%
+                   mutate_at(.vars = c(weight),
+                             .funs = funs(cumulative_wgt = cumsum(.)/weight_sum)
+                             ) %>%
+                   mutate_at(.vars = c(predictions),
+                             .funs = funs(loss_ratio_band = cut(cumulative_wgt,
+                                                                breaks = c(0, cut_tbl[[cut_tbl_bin]]),
+                                                                labels = cut_tbl[[cut_tbl_label]])
+                                         )
+                            )
+} else{
+        df_sort <- data %>%
+                   arrange_at(.vars = c(predictions)) %>%
+                   mutate_at(.vars = c(weight),
+                             .funs = funs(loss_ratio_band = floor(cumsum(.) / weight_sum * 10)/10)
+                            )
+} 
+
+df_plm <- data %>%
+            group_by(PLM_decile) %>%
+            summarise(plm_loss_ratio = sum(!!sym(actual_loss))/sum(!!sym(weight)))
+    
+df_temp <- df_sort %>%
+            group_by(loss_ratio_band) %>%
+            summarise(model_loss_ratio = sum(!!sym(predictions)*!!sym(weight))/sum(!!sym(weight)),
+                      actual_loss_ratio = sum(!!sym(actual_loss))/sum(!!sym(weight))) %>%
+            ungroup()
+
+df_temp <- cbind(df_temp, )
+    
+df_temp$loss_ratio_band <- as.factor(df_temp$loss_ratio_band)
+#df_temp$POLICY_YEAR <- as.factor(df_temp$POLICY_YEAR)
+    
+ chart <- df_temp %>%
+          plot_ly(x = ~loss_ratio_band,
+                  y= ~actual_loss_ratio,
+                  #split = ~POLICY_YEAR, 
+                  type = 'scatter', mode = 'lines+markers') %>%
+          add_trace(x = ~loss_ratio_band,
+                    y = ~plm_loss_ratio,
+                    type = 'scatter', mode = 'lines+markers') %>%
+                  layout(title = 'Actual vs. Predicted vs. PLM Loss Ratio',
+                    xaxis = list(title = "Percentile"),
+                    yaxis = list(title = "Loss Ratio"))
+
+ return(chart)
+# return(df_temp)
+}
